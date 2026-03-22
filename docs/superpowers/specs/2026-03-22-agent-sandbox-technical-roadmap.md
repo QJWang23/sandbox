@@ -825,19 +825,19 @@ graph LR
 ```mermaid
 graph TB
     A[沙箱生命周期] --> B{Fork}
-    B -->|CoW机制| C[快速克隆<br/><100ms]
+    B -->|CoW机制| C[快速克隆<br/>100ms以内]
 
     A --> D{Checkpoint}
-    D -->|CRIU/内核快照| E[状态保存<br/><1秒]
+    D -->|CRIU/内核快照| E[状态保存<br/>1秒以内]
 
     E --> F{Resume}
-    F -->|反序列化| G[状态恢复<br/><1秒]
+    F -->|反序列化| G[状态恢复<br/>1秒以内]
 
     A --> H{Pause}
-    H -->|cgroup冻结| I[暂停执行<br/><100ms]
+    H -->|cgroup冻结| I[暂停执行<br/>100ms以内]
 
     I --> J{Resume from Pause}
-    J -->|cgroup解冻| K[继续执行<br/><100ms]
+    J -->|cgroup解冻| K[继续执行<br/>100ms以内]
 ```
 
 **技术原理**:
