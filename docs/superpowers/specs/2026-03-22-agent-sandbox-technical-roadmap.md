@@ -493,27 +493,27 @@ graph TB
 
 ```mermaid
 graph TB
-    graph "K8s集群"
+    subgraph "K8s集群"
         A[沙箱Pod 1] -->|镜像层| B[Node 1缓存]
         C[沙箱Pod 2] -->|镜像层| D[Node 2缓存]
         E[沙箱Pod 3] -->|镜像层| F[Node 3缓存]
     end
 
-    graph "openEuler缓存共享层"
+    subgraph "openEuler缓存共享层"
         B --> G[KSM<br/>内存合并]
         D --> G
         F --> G
         G --> H[共享内存池<br/>只读层共享]
     end
 
-    graph "集群级缓存管理"
+    subgraph "集群级缓存管理"
         H --> I[全局缓存调度]
         I --> J[热点镜像预热]
         I --> K[缓存淘汰策略]
         I --> L[跨节点缓存共享]
     end
 
-    graph "集群级收益"
+    subgraph "集群级收益"
         J --> M[镜像拉取<br/>0ms延迟]
         K --> N[内存利用率<br/>提升2倍]
         L --> O[存储成本<br/>降低70%]
