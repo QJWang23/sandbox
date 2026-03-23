@@ -53,7 +53,7 @@ graph TB
 
     subgraph "硬件亲和扩展层"
         A -.->|插件化扩展| E[HW-Aware<br/>Scheduler]
-        B -.->|注解集成| F[Pool Manager<br/>with HW Affinity
+        B -.->|注解集成| F[Pool Manager<br/>with HW Affinity]
         C -.->|RuntimeClass| G[Runtime Manager]
     end
 
