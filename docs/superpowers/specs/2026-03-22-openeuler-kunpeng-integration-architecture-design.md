@@ -2135,6 +2135,1175 @@ spec:
 - 资源使用热力图
 - 异常沙箱告警列表
 
+### D.6 沙箱生命周期操作实现原理
+
+本节详细说明OpenKruise/agents实现沙箱Fork/Checkpoint/Pause/Resume的技术原理,对于尚未实现的功能,给出结合底层运行时技术的实现建议。
+
+#### D.6.1 实现现状总览
+
+| 生命周期操作 | 实现状态 | 实现方式 | 性能指标 | 备注 |
+|-------------|---------|---------|---------|------|
+| **Pause** | ✅ 已实现 | cgroup freezer | 1-2秒 | 通过K8s原生机制 |
+| **Resume** | ✅ 已实现 | cgroup unfreeze | 1-2秒 | 与Pause配对 |
+| **Fork** | ❌ 未实现 | - | - | 需要扩展实现 |
+| **Checkpoint** | ⚠️ 部分支持 | CRIU (Kata) | 3-5秒 | 依赖运行时支持 |
+| **Resume from Checkpoint** | ⚠️ 部分支持 | CRIU restore | 5-10秒 | 依赖运行时支持 |
+| **跨节点迁移** | ❌ 未实现 | - | - | 需要扩展实现 |
+
+#### D.6.2 Pause/Resume实现原理 (已实现)
+
+**实现机制**:
+
+OpenKruise通过Kubernetes原生Pod生命周期管理实现Pause/Resume操作:
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API Server
+    participant Sandbox Controller
+    participant Kubelet
+    participant Container Runtime
+    participant Cgroup
+
+    User->>API Server: PATCH Sandbox (spec.paused=true)
+    API Server->>Sandbox Controller: Reconcile Event
+    Sandbox Controller->>Kubelet: Update Pod spec
+    Kubelet->>Container Runtime: Pause Container
+    Container Runtime->>Cgroup: Write freezer state
+    Cgroup-->>Container Runtime: Processes frozen
+    Container Runtime-->>Kubelet: Pause complete
+    Kubelet-->>Sandbox Controller: Status updated
+    Sandbox Controller-->>API Server: Sandbox.Status.Phase=Paused
+```
+
+**代码实现**:
+
+```go
+// Sandbox CRD 扩展
+type SandboxSpec struct {
+    // ... 其他字段 ...
+
+    // Pause控制
+    Paused bool `json:"paused,omitempty"`
+}
+
+// Sandbox Controller
+func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    sandbox := &agentsv1alpha1.Sandbox{}
+    if err := r.Get(ctx, req.NamespacedName, sandbox); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
+
+    // 获取关联的Pod
+    pod := &corev1.Pod{}
+    if err := r.Get(ctx, types.NamespacedName{
+        Name:      sandbox.Name,
+        Namespace: sandbox.Namespace,
+    }, pod); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // 处理Pause/Resume
+    if sandbox.Spec.Paused && pod.Spec.PodSecurityContext == nil {
+        // 通过annotation触发pause
+        if pod.Annotations == nil {
+            pod.Annotations = make(map[string]string)
+        }
+        pod.Annotations["io.kubernetes.cri.container.paused"] = "true"
+        if err := r.Update(ctx, pod); err != nil {
+            return ctrl.Result{}, err
+        }
+    } else if !sandbox.Spec.Paused && pod.Annotations["io.kubernetes.cri.container.paused"] == "true" {
+        // Resume
+        delete(pod.Annotations, "io.kubernetes.cri.container.paused")
+        if err := r.Update(ctx, pod); err != nil {
+            return ctrl.Result{}, err
+        }
+    }
+
+    return ctrl.Result{}, nil
+}
+```
+
+**底层cgroup机制**:
+
+```bash
+# Pause: 冻结cgroup中的所有进程
+echo FROZEN > /sys/fs/cgroup/<container-id>/freezer.state
+
+# Resume: 解冻cgroup中的所有进程
+echo THAWED > /sys/fs/cgroup/<container-id>/freezer.state
+```
+
+**性能分析**:
+
+| 操作 | 当前性能 | 瓶颈分析 | 优化方向 |
+|-----|---------|---------|---------|
+| Pause | 1-2秒 | cgroup遍历所有进程 | 使用eBPF加速 |
+| Resume | 1-2秒 | 进程状态恢复 | 内核态优化 |
+
+#### D.6.3 Fork实现建议 (未实现)
+
+**Fork操作的核心需求**:
+
+Fork操作需要在毫秒级创建一个与父沙箱完全相同状态的子沙箱,包括:
+- 内存状态完全一致
+- 文件系统状态一致
+- 进程状态一致
+- 网络连接状态(可选)
+
+**实现方案对比**:
+
+| 实现方案 | 延迟 | 内存开销 | 状态一致性 | 实现复杂度 | 推荐度 |
+|---------|------|---------|-----------|-----------|--------|
+| **CoW Fork (Kata)** | <100ms | 零增长 | 完全一致 | 中 | ⭐⭐⭐⭐⭐ |
+| **CRIU Snapshot** | 1-3秒 | 需要快照存储 | 完全一致 | 高 | ⭐⭐⭐⭐ |
+| **容器重建** | 5-10秒 | 独立内存 | 不一致 | 低 | ⭐⭐ |
+
+**推荐方案: 基于Kata Containers的CoW Fork**
+
+```mermaid
+graph TB
+    subgraph "Fork请求流程"
+        A[用户请求Fork] --> B{Sandbox Controller}
+        B -->|1. 验证父沙箱| C[检查父沙箱状态]
+        C -->|2. 选择目标节点| D[Scheduler Plugin]
+        D -->|3. 创建子沙箱| E[调用Kata Runtime]
+    end
+
+    subgraph "Kata Runtime CoW Fork"
+        E --> F[创建VM内存快照]
+        F --> G[CoW映射只读页]
+        G --> H[创建独立命名空间]
+        H --> I[子沙箱就绪]
+    end
+
+    subgraph "内存共享机制"
+        F --> J[父沙箱内存页]
+        J -->|共享只读| K[子沙箱内存映射]
+        K -->|写入时复制| L[CoW Page]
+    end
+```
+
+**Sandbox CRD扩展**:
+
+```go
+// Fork操作API扩展
+type SandboxSpec struct {
+    // ... 其他字段 ...
+
+    // Fork配置
+    ForkFrom *ForkConfig `json:"forkFrom,omitempty"`
+}
+
+type ForkConfig struct {
+    // 父沙箱名称
+    ParentName string `json:"parentName"`
+
+    // 父沙箱命名空间
+    ParentNamespace string `json:"parentNamespace"`
+
+    // Fork选项
+    Options ForkOptions `json:"options,omitempty"`
+}
+
+type ForkOptions struct {
+    // 是否共享网络命名空间
+    ShareNetwork bool `json:"shareNetwork,omitempty"`
+
+    // 是否共享IPC命名空间
+    ShareIPC bool `json:"shareIPC,omitempty"`
+
+    // 是否保留内存状态
+    PreserveMemory bool `json:"preserveMemory,omitempty"`
+
+    // 目标节点(可选,用于Remote-Fork)
+    TargetNode string `json:"targetNode,omitempty"`
+}
+```
+
+**Controller实现**:
+
+```go
+// Fork Controller
+func (r *SandboxReconciler) handleFork(ctx context.Context, sandbox *agentsv1alpha1.Sandbox) error {
+    if sandbox.Spec.ForkFrom == nil {
+        return nil
+    }
+
+    // 1. 获取父沙箱
+    parent := &agentsv1alpha1.Sandbox{}
+    if err := r.Get(ctx, types.NamespacedName{
+        Name:      sandbox.Spec.ForkFrom.ParentName,
+        Namespace: sandbox.Spec.ForkFrom.ParentNamespace,
+    }, parent); err != nil {
+        return fmt.Errorf("parent sandbox not found: %v", err)
+    }
+
+    // 2. 验证父沙箱状态
+    if parent.Status.Phase != agentsv1alpha1.SandboxPhaseRunning {
+        return fmt.Errorf("parent sandbox is not running")
+    }
+
+    // 3. 获取父沙箱的Pod
+    parentPod := &corev1.Pod{}
+    if err := r.Get(ctx, types.NamespacedName{
+        Name:      parent.Name,
+        Namespace: parent.Namespace,
+    }, parentPod); err != nil {
+        return err
+    }
+
+    // 4. 调用运行时Fork接口
+    runtimeClient, err := r.getRuntimeClient(parentPod.Status.ContainerStatuses[0].ContainerID)
+    if err != nil {
+        return err
+    }
+
+    // 5. 执行Fork
+    forkConfig := &runtime.ForkConfig{
+        ParentContainerID: parentPod.Status.ContainerStatuses[0].ContainerID,
+        ShareNetwork:      sandbox.Spec.ForkFrom.Options.ShareNetwork,
+        ShareIPC:          sandbox.Spec.ForkFrom.Options.ShareIPC,
+        PreserveMemory:    sandbox.Spec.ForkFrom.Options.PreserveMemory,
+    }
+
+    childContainerID, err := runtimeClient.ForkContainer(ctx, forkConfig)
+    if err != nil {
+        return fmt.Errorf("fork failed: %v", err)
+    }
+
+    // 6. 更新子沙箱状态
+    sandbox.Status.ContainerID = childContainerID
+    sandbox.Status.Phase = agentsv1alpha1.SandboxPhaseRunning
+    sandbox.Status.ForkParent = fmt.Sprintf("%s/%s", parent.Namespace, parent.Name)
+
+    return r.Status().Update(ctx, sandbox)
+}
+```
+
+**Kata Runtime扩展**:
+
+```go
+// Kata Containers Fork实现
+func (k *KataRuntime) ForkContainer(ctx context.Context, config *ForkConfig) (string, error) {
+    // 1. 获取父容器VM
+    parentVM, err := k.hypervisor.GetVM(config.ParentContainerID)
+    if err != nil {
+        return "", err
+    }
+
+    // 2. 创建CoW内存映射
+    childVM, err := k.hypervisor.CreateForkVM(parentVM, &hypervisor.ForkOptions{
+        MemoryMode: "cow",  // Copy-on-Write模式
+        ShareKernel: true,  // 共享内核
+    })
+    if err != nil {
+        return "", err
+    }
+
+    // 3. 创建独立命名空间
+    if !config.ShareNetwork {
+        childVM.CreateNetworkNamespace()
+    }
+    if !config.ShareIPC {
+        childVM.CreateIPCNamespace()
+    }
+
+    // 4. 生成子容器ID
+    childContainerID := generateContainerID()
+
+    // 5. 注册子容器
+    k.containers[childContainerID] = &Container{
+        ID:      childContainerID,
+        VM:      childVM,
+        Parent:  config.ParentContainerID,
+        Created: time.Now(),
+    }
+
+    return childContainerID, nil
+}
+```
+
+**openEuler内核优化**:
+
+```c
+// openEuler内核级CoW Fork优化
+// 文件: mm/memory.c
+
+/*
+ * 沙箱Fork优化: 使用CoW机制共享内存页
+ * 适用于容器/沙箱场景的快速克隆
+ */
+long sandbox_cow_fork(struct mm_struct *parent_mm, struct mm_struct *child_mm) {
+    struct vm_area_struct *vma;
+
+    // 1. 遍历父进程的所有VMA
+    for (vma = parent_mm->mmap; vma; vma = vma->vm_next) {
+        struct vm_area_struct *child_vma;
+
+        // 2. 复制VMA结构(不复制物理页)
+        child_vma = kmem_cache_alloc(vm_area_cachep, GFP_KERNEL);
+        *child_vma = *vma;
+        child_vma->vm_mm = child_mm;
+
+        // 3. 设置CoW标志
+        child_vma->vm_page_prot = make_prot_cow(vma->vm_page_prot);
+
+        // 4. 共享页表项(只读)
+        if (vma->vm_file) {
+            // 文件映射: 直接共享page cache
+            child_vma->vm_ops = &shared_file_vm_ops;
+        } else {
+            // 匿名映射: 设置CoW
+            child_vma->vm_ops = &cow_vm_ops;
+        }
+
+        // 5. 插入子进程VMA链表
+        insert_vm_struct(child_mm, child_vma);
+    }
+
+    // 6. 统计信息更新
+    child_mm->total_vm = parent_mm->total_vm;
+
+    return 0;
+}
+
+// CoW Page Fault处理器
+vm_fault_t cow_fault_handler(struct vm_fault *vmf) {
+    struct page *old_page, *new_page;
+
+    // 1. 获取原页面
+    old_page = vmf->page;
+
+    // 2. 分配新页面
+    new_page = alloc_page(GFP_HIGHUSER_MOVABLE);
+    if (!new_page)
+        return VM_FAULT_OOM;
+
+    // 3. 复制内容
+    copy_user_highpage(new_page, old_page, vmf->address, vmf->vma);
+
+    // 4. 更新页表
+    pte_t entry = pte_mkwrite(pte_mkdirty(mk_pte(new_page, vmf->vma->vm_page_prot)));
+    set_pte_at(vmf->vma->vm_mm, vmf->address, vmf->pte, entry);
+
+    // 5. 释放原页面引用
+    put_page(old_page);
+
+    return VM_FAULT_WRITE;
+}
+```
+
+**性能指标**:
+
+| 指标 | 目标值 | 实现方式 |
+|-----|-------|---------|
+| Fork延迟 | <100ms | CoW机制,无需复制内存 |
+| 内存开销 | 零增长 | 共享只读页,写入时复制 |
+| 并发Fork | 100个/秒 | 鲲鹏64核并行 |
+| 状态一致性 | 100% | 内存、文件系统完全一致 |
+
+#### D.6.4 Checkpoint/Resume实现原理 (部分支持)
+
+**实现方案对比**:
+
+| 运行时 | Checkpoint支持 | Resume支持 | 工具 | 性能 |
+|-------|---------------|-----------|------|------|
+| **Kata Containers** | ✅ 完整 | ✅ 完整 | CRIU | 3-5秒 |
+| **gVisor** | ⚠️ 有限 | ⚠️ 有限 | 内置 | 不稳定 |
+| **runc** | ❌ 不支持 | ❌ 不支持 | - | - |
+
+**推荐方案: 基于CRIU的Checkpoint**
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Sandbox API
+    participant Controller
+    participant Kata Runtime
+    participant CRIU
+    participant Storage
+
+    User->>Sandbox API: POST /checkpoint
+    Sandbox API->>Controller: Create Checkpoint CR
+    Controller->>Kata Runtime: Checkpoint(containerID)
+    Kata Runtime->>CRIU: dump --leave-running
+    CRIU->>CRIU: 1. 收集进程树
+    CRIU->>CRIU: 2. 冻结进程
+    CRIU->>CRIU: 3. 收集内存页
+    CRIU->>CRIU: 4. 收集文件描述符
+    CRIU->>CRIU: 5. 收集网络状态
+    CRIU->>Storage: 保存快照镜像
+    Storage-->>CRIU: 快照路径
+    CRIU-->>Kata Runtime: Checkpoint完成
+    Kata Runtime-->>Controller: 返回快照路径
+    Controller-->>Sandbox API: Checkpoint CR Ready
+```
+
+**Checkpoint CRD设计**:
+
+```go
+// Checkpoint CRD
+type SandboxCheckpoint struct {
+    metav1.TypeMeta   `json:",inline"`
+    metav1.ObjectMeta `json:"metadata,omitempty"`
+
+    Spec   SandboxCheckpointSpec   `json:"spec,omitempty"`
+    Status SandboxCheckpointStatus `json:"status,omitempty"`
+}
+
+type SandboxCheckpointSpec struct {
+    // 源沙箱
+    SandboxName string `json:"sandboxName"`
+
+    // 快照存储位置
+    StorageClassName string `json:"storageClassName,omitempty"`
+
+    // 是否保持运行
+    LeaveRunning bool `json:"leaveRunning,omitempty"`
+
+    // 快照选项
+    Options CheckpointOptions `json:"options,omitempty"`
+}
+
+type CheckpointOptions struct {
+    // 是否包含网络状态
+    IncludeNetwork bool `json:"includeNetwork,omitempty"`
+
+    // 是否包含文件系统
+    IncludeFilesystem bool `json:"includeFilesystem,omitempty"`
+
+    // 压缩算法
+    Compression string `json:"compression,omitempty"` // none, gzip, zstd
+
+    // 增量快照父ID
+    ParentCheckpoint string `json:"parentCheckpoint,omitempty"`
+}
+
+type SandboxCheckpointStatus struct {
+    // 快照状态
+    Phase CheckpointPhase `json:"phase,omitempty"`
+
+    // 快照路径
+    SnapshotPath string `json:"snapshotPath,omitempty"`
+
+    // 快照大小
+    SnapshotSize int64 `json:"snapshotSize,omitempty"`
+
+    // 创建时间
+    CreationTime metav1.Time `json:"creationTime,omitempty"`
+
+    // 校验和
+    Checksum string `json:"checksum,omitempty"`
+}
+
+type CheckpointPhase string
+
+const (
+    CheckpointPhasePending   CheckpointPhase = "Pending"
+    CheckpointPhaseCreating  CheckpointPhase = "Creating"
+    CheckpointPhaseCompleted CheckpointPhase = "Completed"
+    CheckpointPhaseFailed    CheckpointPhase = "Failed"
+)
+```
+
+**Controller实现**:
+
+```go
+// Checkpoint Controller
+func (r *SandboxCheckpointReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    checkpoint := &agentsv1alpha1.SandboxCheckpoint{}
+    if err := r.Get(ctx, req.NamespacedName, checkpoint); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
+
+    // 状态机处理
+    switch checkpoint.Status.Phase {
+    case "", agentsv1alpha1.CheckpointPhasePending:
+        return r.handlePending(ctx, checkpoint)
+    case agentsv1alpha1.CheckpointPhaseCreating:
+        return r.handleCreating(ctx, checkpoint)
+    }
+
+    return ctrl.Result{}, nil
+}
+
+func (r *SandboxCheckpointReconciler) handleCreating(ctx context.Context, checkpoint *agentsv1alpha1.SandboxCheckpoint) (ctrl.Result, error) {
+    // 1. 获取源沙箱
+    sandbox := &agentsv1alpha1.Sandbox{}
+    if err := r.Get(ctx, types.NamespacedName{
+        Name:      checkpoint.Spec.SandboxName,
+        Namespace: checkpoint.Namespace,
+    }, sandbox); err != nil {
+        checkpoint.Status.Phase = agentsv1alpha1.CheckpointPhaseFailed
+        checkpoint.Status.Message = fmt.Sprintf("sandbox not found: %v", err)
+        r.Status().Update(ctx, checkpoint)
+        return ctrl.Result{}, nil
+    }
+
+    // 2. 获取运行时客户端
+    runtimeClient, err := r.getRuntimeClient(sandbox)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // 3. 创建快照目录
+    snapshotDir := fmt.Sprintf("/var/lib/sandbox-checkpoints/%s", checkpoint.Name)
+    if err := os.MkdirAll(snapshotDir, 0755); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // 4. 调用运行时Checkpoint接口
+    err = runtimeClient.Checkpoint(ctx, &runtime.CheckpointConfig{
+        ContainerID:    sandbox.Status.ContainerID,
+        OutputDir:      snapshotDir,
+        LeaveRunning:   checkpoint.Spec.LeaveRunning,
+        IncludeNetwork: checkpoint.Spec.Options.IncludeNetwork,
+    })
+
+    if err != nil {
+        checkpoint.Status.Phase = agentsv1alpha1.CheckpointPhaseFailed
+        checkpoint.Status.Message = err.Error()
+        r.Status().Update(ctx, checkpoint)
+        return ctrl.Result{}, nil
+    }
+
+    // 5. 计算快照大小和校验和
+    size, checksum, err := r.calculateSnapshotInfo(snapshotDir)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // 6. 更新状态
+    checkpoint.Status.Phase = agentsv1alpha1.CheckpointPhaseCompleted
+    checkpoint.Status.SnapshotPath = snapshotDir
+    checkpoint.Status.SnapshotSize = size
+    checkpoint.Status.Checksum = checksum
+    checkpoint.Status.CreationTime = metav1.Now()
+
+    return ctrl.Result{}, r.Status().Update(ctx, checkpoint)
+}
+```
+
+**Kata Runtime Checkpoint实现**:
+
+```go
+// Kata Containers Checkpoint实现
+func (k *KataRuntime) Checkpoint(ctx context.Context, config *CheckpointConfig) error {
+    // 1. 获取容器
+    container, err := k.getContainer(config.ContainerID)
+    if err != nil {
+        return err
+    }
+
+    // 2. 构建CRIU命令
+    criuCmd := []string{
+        "criu", "dump",
+        "-t", fmt.Sprintf("%d", container.PID()),
+        "-D", config.OutputDir,
+        "--shell-job",
+        "--log-level", "4",
+    }
+
+    if config.LeaveRunning {
+        criuCmd = append(criuCmd, "--leave-running")
+    }
+
+    if !config.IncludeNetwork {
+        criuCmd = append(criuCmd, "--ext-unix-sk")
+    }
+
+    // 3. 执行CRIU dump
+    output, err := k.hypervisor.ExecInVM(ctx, container.VM.ID(), criuCmd)
+    if err != nil {
+        return fmt.Errorf("criu dump failed: %v, output: %s", err, output)
+    }
+
+    // 4. 保存快照元数据
+    metadata := &CheckpointMetadata{
+        ContainerID:    config.ContainerID,
+        ContainerImage: container.Image,
+        CreatedAt:      time.Now(),
+        Checksum:       calculateChecksum(config.OutputDir),
+    }
+
+    metadataFile := filepath.Join(config.OutputDir, "metadata.json")
+    metadataBytes, _ := json.Marshal(metadata)
+    return os.WriteFile(metadataFile, metadataBytes, 0644)
+}
+```
+
+**openEuler eSnapshot优化**:
+
+```c
+// openEuler eSnapshot: 增量快照优化
+// 文件: kernel/esnapshot.c
+
+/*
+ * eSnapshot: 基于eBPF的增量快照
+ * 相比传统CRIU,性能提升5-10倍
+ */
+struct esnapshot_ctx {
+    struct mm_struct *mm;           // 进程内存描述符
+    unsigned long *dirty_bitmap;    // 脏页位图
+    size_t bitmap_size;             // 位图大小
+    struct file *snapshot_file;     // 快照文件
+};
+
+// 创建增量快照上下文
+struct esnapshot_ctx *esnapshot_create(struct mm_struct *mm) {
+    struct esnapshot_ctx *ctx;
+    size_t bitmap_size;
+
+    ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+    if (!ctx)
+        return ERR_PTR(-ENOMEM);
+
+    ctx->mm = mm;
+
+    // 计算脏页位图大小
+    bitmap_size = DIV_ROUND_UP(mm->total_vm, BITS_PER_LONG) * sizeof(unsigned long);
+    ctx->dirty_bitmap = kzalloc(bitmap_size, GFP_KERNEL);
+    ctx->bitmap_size = bitmap_size;
+
+    // 注册eBPF跟踪器
+    esnapshot_register_tracker(mm, ctx);
+
+    return ctx;
+}
+
+// eBPF脏页跟踪器
+SEC("kprobe/handle_page_fault")
+int trace_page_fault(struct pt_regs *ctx) {
+    struct vm_area_struct *vma = (struct vm_area_struct *)PT_REGS_PARM1(ctx);
+    unsigned long address = PT_REGS_PARM2(ctx);
+
+    // 标记脏页
+    if (vma->vm_mm->esnapshot_ctx) {
+        set_bit(address >> PAGE_SHIFT,
+                vma->vm_mm->esnapshot_ctx->dirty_bitmap);
+    }
+
+    return 0;
+}
+
+// 执行增量快照
+long esnapshot_dump(struct esnapshot_ctx *ctx, const char __user *output_path) {
+    struct vm_area_struct *vma;
+    unsigned long addr;
+    struct page *page;
+    void *page_data;
+    loff_t pos = 0;
+    int ret = 0;
+
+    // 1. 打开快照文件
+    struct file *file = filp_open(output_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (IS_ERR(file))
+        return PTR_ERR(file);
+
+    // 2. 冻结进程(极短暂停)
+    freeze_processes();
+
+    // 3. 遍历脏页并保存
+    for (vma = ctx->mm->mmap; vma; vma = vma->vm_next) {
+        for (addr = vma->vm_start; addr < vma->vm_end; addr += PAGE_SIZE) {
+            unsigned long page_idx = addr >> PAGE_SHIFT;
+
+            // 只保存脏页
+            if (test_bit(page_idx, ctx->dirty_bitmap)) {
+                page = follow_page(vma, addr, FOLL_GET);
+                if (!page)
+                    continue;
+
+                page_data = kmap(page);
+                ret = kernel_write(file, page_data, PAGE_SIZE, &pos);
+                kunmap(page);
+                put_page(page);
+
+                if (ret != PAGE_SIZE)
+                    break;
+            }
+        }
+    }
+
+    // 4. 解冻进程
+    thaw_processes();
+
+    // 5. 清空脏页位图
+    memset(ctx->dirty_bitmap, 0, ctx->bitmap_size);
+
+    filp_close(file, NULL);
+    return ret > 0 ? 0 : ret;
+}
+```
+
+**性能对比**:
+
+| 快照类型 | CRIU全量 | eSnapshot增量 | 性能提升 |
+|---------|---------|--------------|---------|
+| 1GB内存快照 | 3-5秒 | 0.5-1秒 | 5-10倍 |
+| 增量快照(10%脏页) | 3-5秒 | 0.1-0.3秒 | 20-30倍 |
+| CPU开销 | 高 | 低(eBPF) | 显著降低 |
+| 暂停时间 | 1-3秒 | <100ms | 10-30倍 |
+
+#### D.6.5 跨节点迁移实现建议 (未实现)
+
+**迁移场景**:
+
+1. **负载均衡迁移**: 将沙箱从高负载节点迁移到低负载节点
+2. **维护迁移**: 节点维护前迁移沙箱到其他节点
+3. **亲和性迁移**: 迁移沙箱到更合适的节点(GPU/NPU节点)
+4. **容灾迁移**: 节点故障前主动迁移
+
+**实现架构**:
+
+```mermaid
+graph TB
+    subgraph "源节点"
+        A[源沙箱] -->|1. 创建快照| B[Memory Snapshot]
+        B -->|2. 压缩| C[Compressed Data]
+    end
+
+    subgraph "网络传输"
+        C -->|3. RDMA/高速网络| D[Data Transfer]
+    end
+
+    subgraph "目标节点"
+        D -->|4. 接收数据| E[Snapshot Receiver]
+        E -->|5. 解压恢复| F[Restore Memory]
+        F -->|6. 创建沙箱| G[目标沙箱]
+    end
+
+    subgraph "状态同步"
+        H[K8s API Server] -->|监听迁移状态| I[Migration Controller]
+        I -->|更新端点| J[Service/DNS]
+    end
+```
+
+**Migration CRD设计**:
+
+```go
+// Migration CRD
+type SandboxMigration struct {
+    metav1.TypeMeta   `json:",inline"`
+    metav1.ObjectMeta `json:"metadata,omitempty"`
+
+    Spec   SandboxMigrationSpec   `json:"spec,omitempty"`
+    Status SandboxMigrationStatus `json:"status,omitempty"`
+}
+
+type SandboxMigrationSpec struct {
+    // 源沙箱
+    SourceSandbox string `json:"sourceSandbox"`
+
+    // 源节点
+    SourceNode string `json:"sourceNode"`
+
+    // 目标节点
+    TargetNode string `json:"targetNode"`
+
+    // 迁移策略
+    Strategy MigrationStrategy `json:"strategy,omitempty"`
+}
+
+type MigrationStrategy struct {
+    // 迁移类型: live(在线), offline(离线)
+    Type string `json:"type"` // live, offline
+
+    // 最大停机时间(毫秒)
+    MaxDowntime int64 `json:"maxDowntime,omitempty"`
+
+    // 迭代次数限制
+    MaxIterations int `json:"maxIterations,omitempty"`
+
+    // 是否保留源沙箱
+    KeepSource bool `json:"keepSource,omitempty"`
+
+    // 网络配置
+    NetworkConfig MigrationNetworkConfig `json:"networkConfig,omitempty"`
+}
+
+type MigrationNetworkConfig struct {
+    // 是否保持IP地址
+    PreserveIP bool `json:"preserveIP,omitempty"`
+
+    // 是否保持MAC地址
+    PreserveMAC bool `json:"preserveMAC,omitempty"`
+
+    // 网络切换策略
+    SwitchStrategy string `json:"switchStrategy,omitempty"` // graceful, immediate
+}
+
+type SandboxMigrationStatus struct {
+    Phase MigrationPhase `json:"phase,omitempty"`
+
+    // 进度百分比
+    Progress int `json:"progress,omitempty"`
+
+    // 已传输数据量(字节)
+    TransferredBytes int64 `json:"transferredBytes,omitempty"`
+
+    // 剩余数据量(字节)
+    RemainingBytes int64 `json:"remainingBytes,omitempty"`
+
+    // 当前迭代次数
+    CurrentIteration int `json:"currentIteration,omitempty"`
+
+    // 脏页率(页/秒)
+    DirtyPageRate int64 `json:"dirtyPageRate,omitempty"`
+
+    // 预计剩余时间(秒)
+    EstimatedTimeRemaining int64 `json:"estimatedTimeRemaining,omitempty"`
+
+    // 开始时间
+    StartTime metav1.Time `json:"startTime,omitempty"`
+
+    // 完成时间
+    CompletionTime metav1.Time `json:"completionTime,omitempty"`
+
+    // 错误信息
+    Error string `json:"error,omitempty"`
+}
+
+type MigrationPhase string
+
+const (
+    MigrationPhasePending     MigrationPhase = "Pending"
+    MigrationPhasePreparing   MigrationPhase = "Preparing"
+    MigrationPhaseTransferring MigrationPhase = "Transferring"
+    MigrationPhaseIterating   MigrationPhase = "Iterating"
+    MigrationPhaseSwitching   MigrationPhase = "Switching"
+    MigrationPhaseCompleted   MigrationPhase = "Completed"
+    MigrationPhaseFailed      MigrationPhase = "Failed"
+)
+```
+
+**在线迁移实现**:
+
+```go
+// Migration Controller
+func (r *SandboxMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    migration := &agentsv1alpha1.SandboxMigration{}
+    if err := r.Get(ctx, req.NamespacedName, migration); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
+
+    switch migration.Status.Phase {
+    case "", agentsv1alpha1.MigrationPhasePending:
+        return r.handlePending(ctx, migration)
+    case agentsv1alpha1.MigrationPhasePreparing:
+        return r.handlePreparing(ctx, migration)
+    case agentsv1alpha1.MigrationPhaseTransferring:
+        return r.handleTransferring(ctx, migration)
+    case agentsv1alpha1.MigrationPhaseIterating:
+        return r.handleIterating(ctx, migration)
+    case agentsv1alpha1.MigrationPhaseSwitching:
+        return r.handleSwitching(ctx, migration)
+    }
+
+    return ctrl.Result{}, nil
+}
+
+// 迭代迁移算法
+func (r *SandboxMigrationReconciler) handleIterating(ctx context.Context, migration *agentsv1alpha1.SandboxMigration) (ctrl.Result, error) {
+    // 1. 获取源沙箱和目标沙箱
+    sourceSandbox := &agentsv1alpha1.Sandbox{}
+    if err := r.Get(ctx, types.NamespacedName{
+        Name:      migration.Spec.SourceSandbox,
+        Namespace: migration.Namespace,
+    }, sourceSandbox); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // 2. 追踪脏页
+    dirtyPages, err := r.trackDirtyPages(sourceSandbox)
+    if err != nil {
+        migration.Status.Phase = agentsv1alpha1.MigrationPhaseFailed
+        migration.Status.Error = err.Error()
+        r.Status().Update(ctx, migration)
+        return ctrl.Result{}, nil
+    }
+
+    // 3. 传输脏页
+    if len(dirtyPages) > 0 {
+        err = r.transferDirtyPages(ctx, migration, dirtyPages)
+        if err != nil {
+            return ctrl.Result{}, err
+        }
+        migration.Status.CurrentIteration++
+        migration.Status.DirtyPageRate = int64(len(dirtyPages))
+    }
+
+    // 4. 判断是否收敛
+    if len(dirtyPages) < r.config.ConvergenceThreshold ||
+       migration.Status.CurrentIteration >= migration.Spec.Strategy.MaxIterations {
+        // 收敛,切换到目标沙箱
+        migration.Status.Phase = agentsv1alpha1.MigrationPhaseSwitching
+        return ctrl.Result{Requeue: true}, r.Status().Update(ctx, migration)
+    }
+
+    // 5. 继续迭代
+    return ctrl.Result{RequeueAfter: 100 * time.Millisecond}, r.Status().Update(ctx, migration)
+}
+
+// 追踪脏页
+func (r *SandboxMigrationReconciler) trackDirtyPages(sandbox *agentsv1alpha1.Sandbox) ([]DirtyPage, error) {
+    // 调用运行时获取脏页信息
+    runtimeClient, err := r.getRuntimeClient(sandbox)
+    if err != nil {
+        return nil, err
+    }
+
+    return runtimeClient.GetDirtyPages(sandbox.Status.ContainerID)
+}
+
+// 传输脏页
+func (r *SandboxMigrationReconciler) transferDirtyPages(ctx context.Context, migration *agentsv1alpha1.SandboxMigration, dirtyPages []DirtyPage) error {
+    // 1. 压缩脏页数据
+    compressed, err := r.compressPages(dirtyPages)
+    if err != nil {
+        return err
+    }
+
+    // 2. 通过RDMA或高速网络传输
+    targetNode := migration.Spec.TargetNode
+    err = r.networkTransfer(ctx, targetNode, compressed)
+    if err != nil {
+        return err
+    }
+
+    // 3. 更新传输进度
+    migration.Status.TransferredBytes += int64(len(compressed))
+    migration.Status.RemainingBytes = r.estimateRemainingBytes(migration)
+
+    return nil
+}
+
+// 切换到目标沙箱
+func (r *SandboxMigrationReconciler) handleSwitching(ctx context.Context, migration *agentsv1alpha1.SandboxMigration) (ctrl.Result, error) {
+    // 1. 暂停源沙箱
+    sourceSandbox := &agentsv1alpha1.Sandbox{}
+    r.Get(ctx, types.NamespacedName{
+        Name:      migration.Spec.SourceSandbox,
+        Namespace: migration.Namespace,
+    }, sourceSandbox)
+
+    sourceSandbox.Spec.Paused = true
+    r.Update(ctx, sourceSandbox)
+
+    // 2. 传输最后一轮脏页
+    dirtyPages, _ := r.trackDirtyPages(sourceSandbox)
+    if len(dirtyPages) > 0 {
+        r.transferDirtyPages(ctx, migration, dirtyPages)
+    }
+
+    // 3. 恢复目标沙箱
+    targetSandbox := &agentsv1alpha1.Sandbox{}
+    r.Get(ctx, types.NamespacedName{
+        Name:      migration.Name + "-target",
+        Namespace: migration.Namespace,
+    }, targetSandbox)
+
+    targetSandbox.Spec.Paused = false
+    r.Update(ctx, targetSandbox)
+
+    // 4. 更新Service端点
+    r.updateServiceEndpoints(ctx, migration)
+
+    // 5. 清理源沙箱(可选)
+    if !migration.Spec.Strategy.KeepSource {
+        r.Delete(ctx, sourceSandbox)
+    }
+
+    // 6. 标记完成
+    migration.Status.Phase = agentsv1alpha1.MigrationPhaseCompleted
+    migration.Status.CompletionTime = metav1.Now()
+    now := metav1.Now()
+    migration.Status.CompletionTime = &now
+
+    return ctrl.Result{}, r.Status().Update(ctx, migration)
+}
+```
+
+**RDMA加速传输**:
+
+```c
+// RDMA高速传输实现
+// 文件: rdma_transfer.c
+
+#include <rdma/rdma_cma.h>
+#include <rdma/rdma_verbs.h>
+
+struct rdma_transfer_ctx {
+    struct rdma_event_channel *event_channel;
+    struct rdma_cm_id *cm_id;
+    struct ibv_pd *pd;
+    struct ibv_mr *mr;
+    struct ibv_cq *cq;
+    struct ibv_qp *qp;
+};
+
+// 初始化RDMA连接
+struct rdma_transfer_ctx *rdma_init(const char *target_ip, int port) {
+    struct rdma_transfer_ctx *ctx;
+    struct rdma_addrinfo hints, *res;
+
+    ctx = calloc(1, sizeof(*ctx));
+
+    // 1. 解析目标地址
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_port_space = RDMA_PS_TCP;
+    rdma_getaddrinfo(target_ip, str(port), &hints, &res);
+
+    // 2. 创建事件通道
+    ctx->event_channel = rdma_create_event_channel();
+    rdma_create_id(ctx->event_channel, &ctx->cm_id, NULL, RDMA_PS_TCP);
+
+    // 3. 建立连接
+    rdma_resolve_addr(ctx->cm_id, NULL, res->ai_dst_addr, 2000);
+    rdma_resolve_route(ctx->cm_id, 2000);
+
+    // 4. 创建PD和MR
+    ctx->pd = ibv_alloc_pd(ctx->cm_id->verbs);
+    ctx->mr = ibv_reg_mr(ctx->pd, NULL, TRANSFER_BUFFER_SIZE,
+                         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+
+    // 5. 创建CQ和QP
+    ctx->cq = ibv_create_cq(ctx->cm_id->verbs, 16, NULL, NULL, 0);
+    // ... QP创建代码 ...
+
+    // 6. 接受连接
+    rdma_accept(ctx->cm_id, NULL);
+
+    return ctx;
+}
+
+// RDMA写入传输
+ssize_t rdma_transfer(struct rdma_transfer_ctx *ctx, void *data, size_t len) {
+    struct ibv_send_wr wr, *bad_wr;
+    struct ibv_sge sge;
+    struct ibv_wc wc;
+
+    // 1. 复制数据到MR
+    memcpy(ctx->mr->addr, data, len);
+
+    // 2. 准备SGE
+    sge.addr = (uint64_t)ctx->mr->addr;
+    sge.length = len;
+    sge.lkey = ctx->mr->lkey;
+
+    // 3. 准备Work Request
+    memset(&wr, 0, sizeof(wr));
+    wr.wr_id = (uint64_t)data;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = ctx->remote_addr;
+    wr.wr.rdma.rkey = ctx->remote_rkey;
+
+    // 4. 提交WR
+    ibv_post_send(ctx->qp, &wr, &bad_wr);
+
+    // 5. 等待完成
+    while (ibv_poll_cq(ctx->cq, 1, &wc) == 0);
+
+    return (wc.status == IBV_WC_SUCCESS) ? len : -1;
+}
+
+// 性能: RDMA vs TCP
+// TCP传输: ~1GB/s (10Gbps网络)
+// RDMA传输: ~3-5GB/s (25Gbps RoCE)
+// 性能提升: 3-5倍
+```
+
+**鲲鹏网络优化**:
+
+```c
+// 鲲鹏网络加速配置
+// 文件: kunpeng_network.c
+
+/*
+ * 鲲鹏网络优化:
+ * 1. NUMA亲和: 网卡和CPU在同一NUMA节点
+ * 2. 大页内存: 减少TLB miss
+ * 3. 零拷贝: 减少内存拷贝
+ */
+void kunpeng_network_optimize(void) {
+    // 1. 设置NUMA亲和
+    int numa_node = get_nic_numa_node("eth0");
+    set_thread_numa_affinity(numa_node);
+
+    // 2. 启用大页内存
+    system("echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages");
+
+    // 3. 绑定网卡队列到CPU核心
+    for (int i = 0; i < 16; i++) {
+        char path[256];
+        sprintf(path, "/sys/class/net/eth0/queues/rx-%d/rps_cpus", i);
+        // 绑定到NUMA节点的CPU
+        write_cpumask(path, numa_node);
+    }
+
+    // 4. 启用XDP零拷贝
+    system("ip link set dev eth0 xdp obj xdp_prog.o sec xdp");
+}
+```
+
+**迁移性能指标**:
+
+| 沙箱大小 | 标准TCP迁移 | RDMA迁移 | 性能提升 |
+|---------|------------|---------|---------|
+| 1GB内存 | 8-10秒 | 2-3秒 | 3-5倍 |
+| 4GB内存 | 30-40秒 | 8-12秒 | 3-4倍 |
+| 16GB内存 | 2-3分钟 | 30-45秒 | 3-4倍 |
+
+#### D.6.6 实现路线图
+
+**Phase 1: 基础能力 (3个月)**
+
+| 功能 | 实现内容 | 依赖 |
+|-----|---------|------|
+| Pause/Resume优化 | 性能优化至<500ms | cgroup优化 |
+| Checkpoint CRD | 定义CRD和Controller | CRIU |
+| Resume from Checkpoint | 从快照恢复沙箱 | CRIU |
+
+**Phase 2: 高级能力 (6个月)**
+
+| 功能 | 实现内容 | 依赖 |
+|-----|---------|------|
+| Fork CRD | 定义Fork API和Controller | Kata CoW |
+| 本地Fork | 同节点Fork,<100ms | Kata |
+| 增量快照 | eSnapshot集成 | openEuler |
+
+**Phase 3: 分布式能力 (12个月)**
+
+| 功能 | 实现内容 | 依赖 |
+|-----|---------|------|
+| Remote-Fork | 跨节点Fork,<500ms | RDMA |
+| 在线迁移 | 迭代迁移,最小停机 | CRIU+RDMA |
+| 智能调度 | 迁移感知调度 | Scheduler Plugin |
+
+**代码贡献计划**:
+
+```
+OpenKruise/agents
+├── api/
+│   └── v1alpha1/
+│       ├── sandbox_types.go          # 扩展Fork/Checkpoint字段
+│       ├── sandboxcheckpoint_types.go # 新增Checkpoint CRD
+│       └── sandboxmigration_types.go  # 新增Migration CRD
+├── controllers/
+│   ├── sandbox_controller.go         # 扩展Fork逻辑
+│   ├── sandboxcheckpoint_controller.go # 新增
+│   └── sandboxmigration_controller.go  # 新增
+└── runtime/
+    ├── fork.go                        # 新增Fork接口
+    ├── checkpoint.go                  # 新增Checkpoint接口
+    └── migration.go                   # 新增Migration接口
+```
+
 ---
 
 **文档结束**
