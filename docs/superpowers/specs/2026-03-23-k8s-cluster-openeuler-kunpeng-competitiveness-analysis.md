@@ -512,9 +512,1130 @@ graph TB
 
 **协同效果总结**:
 - **启动性能**: PageCache + KSM + NUMA = **6秒 → <1秒**
-- **Fork能力**: CoW + Remote-Fork + eSnapshot = **不支支持 → <100ms/500ms**
+- **Fork能力**: CoW + Remote-Fork + eSnapshot = **不支持 → <100ms/500ms**
 - **迁移能力**: Remote-Fork + eSnapshot + RDMA = **不支持 → 3-6秒**
 - **内存效率**: KSM + PageCache + CoW = **内存-70%**
+
+### 2.5 三大核心扩展点的协���架构
+
+基于openEuler底层能力(PageCache、CoW、Remote-Fork、KSM、eSnapshot),需要在K8s集群的三个核心扩展点进行协同:
+
+1. **集群调度(调度插件)** - 资源分配决策
+2. **沙箱运行时管理(RuntimeClass)** - 运行时适配
+3. **沙箱预热池管理(Pool Manager)** - 预热策略增强
+
+#### 2.5.1 底层能力与扩展点协同矩阵
+
+| 底层能力 | 集群调度 | 运行时管理 | 预热池管理 | 协同复杂度 |
+|---------|---------|-----------|-----------|-----------|
+| **PageCache** | ⚠️ 辅助 | ✅ 核心 | ✅ 核心 | 中 |
+| **CoW** | ⚠️ 辅助 | ✅ 核心 | ⚠️ 辅助 | 中 |
+| **Remote-Fork** | ✅ 核心 | ✅ 核心 | ⚠️ 辅助 | 高 |
+| **KSM** | ⚠️ 辅助 | ⚠️ 辅助 | ✅ 核心 | 低 |
+| **eSnapshot** | ✅ 核心 | ✅ 核心 | ✅ 核心 | 高 |
+
+**协同复杂度说明**:
+- **低**: 仅需配置或简单集成
+- **中**: 需要开发Controller或DaemonSet
+- **高**: 需要调度器、运行时、控制器多方协同
+
+---
+
+#### 2.5.2 扩展点一: 集群调度(调度插件)协同
+
+**涉及底层能力**: Remote-Fork、eSnapshot、NUMA、PageCache(辅助)
+
+##### A. 技术构建架构
+
+```mermaid
+graph TB
+    subgraph "K8s调度器扩展"
+        A[Pod请求] --> B[HW-Aware Scheduler Plugin]
+        B --> C{预过滤阶段}
+        C --> D[NUMA拓扑检查]
+        C --> E[PageCache命中率检查]
+        C --> F[Remote-Fork目标节点选择]
+    end
+
+    subgraph "节点状态采集"
+        D --> G[Device Plugin<br/>NUMA拓扑]
+        E --> H[Node Agent<br/>缓存状态]
+        F --> I[Migration Controller<br/>跨节点容量]
+    end
+
+    subgraph "调度决策"
+        B --> J[评分阶段]
+        J --> K[NUMA亲和评分<br/>权重:40%]
+        J --> L[PageCache命中率评分<br/>权重:30%]
+        J --> M[Remote-Fork可行性评分<br/>权重:30%]
+        K --> N[最终节点选择]
+        L --> N
+        M --> N
+    end
+
+    style B fill:#90EE90
+    style N fill:#90EE90
+```
+
+##### B. 调度插件实现
+
+```go
+// HW-Aware Scheduler Plugin
+package scheduler
+
+import (
+    "context"
+    "k8s.io/kubernetes/pkg/scheduler/framework"
+)
+
+type HWAwareScheduler struct {
+    handle    framework.Handle
+    numaCache *NUMACache
+    pageCache *PageCacheState
+}
+
+// PreFilter: 检查节点是否满足硬件亲和要求
+func (h *HWAwareScheduler) PreFilter(
+    ctx context.Context,
+    state *framework.CycleState,
+    pod *v1.Pod,
+) (*framework.PreFilterResult, *framework.Status) {
+    // 1. 检查是否需要NUMA亲和
+    if needsNUMAAffinity(pod) {
+        nodes := h.numaCache.GetNUMANodes()
+        if len(nodes) == 0 {
+            return nil, framework.NewStatus(framework.Unschedulable, "no NUMA-capable nodes")
+        }
+    }
+
+    // 2. 检查是否需要PageCache共享
+    if needsPageCache(pod) {
+        image := pod.Spec.Containers[0].Image
+        available := h.pageCache.CheckImageAvailability(image)
+        if !available {
+            // 触发预热
+            h.triggerPreheat(image)
+        }
+    }
+
+    // 3. 检查是否支持Remote-Fork
+    if needsRemoteFork(pod) {
+        targetNode := pod.Annotations["sandbox.kruise.io/remote-fork-target"]
+        if targetNode != "" {
+            // 验证目标节点可达性
+            if !h.checkRemoteForkFeasibility(targetNode) {
+                return nil, framework.NewStatus(framework.Unschedulable, "remote-fork not feasible")
+            }
+        }
+    }
+
+    return nil, framework.NewStatus(framework.Success, "")
+}
+
+// Filter: 过滤不满足条件的节点
+func (h *HWAwareScheduler) Filter(
+    ctx context.Context,
+    state *framework.CycleState,
+    pod *v1.Pod,
+    nodeInfo *framework.NodeInfo,
+) *framework.Status {
+    node := nodeInfo.Node()
+
+    // 1. NUMA亲和过滤
+    if needsNUMAAffinity(pod) {
+        numaTopology := h.numaCache.GetNodeNUMA(node.Name)
+        if !h.checkNUMAAffinity(pod, numaTopology) {
+            return framework.NewStatus(framework.Unschedulable, "NUMA affinity not satisfied")
+        }
+    }
+
+    // 2. Remote-Fork目标节点过滤
+    if needsRemoteFork(pod) {
+        targetNode := pod.Annotations["sandbox.kruise.io/remote-fork-target"]
+        if targetNode != "" && node.Name != targetNode {
+            return framework.NewStatus(framework.Unschedulable, "not remote-fork target")
+        }
+    }
+
+    return framework.NewStatus(framework.Success, "")
+}
+
+// Score: 评分排序
+func (h *HWAwareScheduler) Score(
+    ctx context.Context,
+    state *framework.CycleState,
+    pod *v1.Pod,
+    nodeInfo *framework.NodeInfo,
+) (int64, *framework.Status) {
+    node := nodeInfo.Node()
+    var totalScore int64 = 0
+
+    // 1. NUMA亲和评分 (权重40%)
+    numaScore := h.scoreNUMAAffinity(pod, node)
+    totalScore += numaScore * 40 / 100
+
+    // 2. PageCache命中率评分 (权重30%)
+    pageCacheScore := h.scorePageCacheHit(pod, node)
+    totalScore += pageCacheScore * 30 / 100
+
+    // 3. Remote-Fork可行性评分 (权重30%)
+    remoteForkScore := h.scoreRemoteForkFeasibility(pod, node)
+    totalScore += remoteForkScore * 30 / 100
+
+    return totalScore, framework.NewStatus(framework.Success, "")
+}
+
+// NUMA亲和评分
+func (h *HWAwareScheduler) scoreNUMAAffinity(pod *v1.Pod, node *v1.Node) int64 {
+    numa := h.numaCache.GetNodeNUMA(node.Name)
+
+    // 检查内存是否在本地NUMA节点
+    localMemoryRatio := numa.GetLocalMemoryRatio()
+    return int64(localMemoryRatio * 100) // 0-100分
+}
+
+// PageCache命中率评分
+func (h *HWAwareScheduler) scorePageCacheHit(pod *v1.Pod, node *v1.Node) int64 {
+    image := pod.Spec.Containers[0].Image
+    hitRate := h.pageCache.GetHitRate(node.Name, image)
+    return int64(hitRate * 100) // 0-100分
+}
+
+// Remote-Fork可行性评分
+func (h *HWAwareScheduler) scoreRemoteForkFeasibility(pod *v1.Pod, node *v1.Node) int64 {
+    // 检查RDMA网络连通性
+    rdmaConnected := h.checkRDMAConnectivity(node.Name)
+    if !rdmaConnected {
+        return 0
+    }
+
+    // 检查目标节点资源
+    resourcesAvailable := h.checkTargetNodeResources(node.Name)
+    if !resourcesAvailable {
+        return 50
+    }
+
+    return 100
+}
+```
+
+##### C. 调度插件配置
+
+```yaml
+# Scheduler Plugin配置
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+profiles:
+- schedulerName: hw-aware-scheduler
+  plugins:
+    preFilter:
+      enabled:
+      - name: HWAwareScheduler
+    filter:
+      enabled:
+      - name: HWAwareScheduler
+    score:
+      enabled:
+      - name: HWAwareScheduler
+  pluginConfig:
+  - name: HWAwareScheduler
+    args:
+      numaAffinityWeight: 40
+      pageCacheWeight: 30
+      remoteForkWeight: 30
+```
+
+##### D. 协同流程
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Scheduler
+    participant HW-Plugin
+    participant NUMA Cache
+    participant PageCache State
+    participant Migration Controller
+
+    User->>Scheduler: 提交沙箱Pod
+    Scheduler->>HW-Plugin: PreFilter
+
+    Note over HW-Plugin: 1. NUMA亲和检查
+    HW-Plugin->>NUMA Cache: 查询NUMA拓扑
+    NUMA Cache-->>HW-Plugin: 返回拓扑信息
+
+    Note over HW-Plugin: 2. PageCache检查
+    HW-Plugin->>PageCache State: 查询镜像缓存
+    PageCache State-->>HW-Plugin: 返回命中率
+
+    Note over HW-Plugin: 3. Remote-Fork检查
+    HW-Plugin->>Migration Controller: 查询跨节点容量
+    Migration Controller-->>HW-Plugin: 返回可行性
+
+    HW-Plugin-->>Scheduler: PreFilter通过
+
+    Scheduler->>HW-Plugin: Score(节点评分)
+    HW-Plugin->>HW-Plugin: 计算综合评分
+    HW-Plugin-->>Scheduler: 返回评分结果
+
+    Scheduler->>Scheduler: 选择最优节点
+    Scheduler-->>User: 绑定节点
+```
+
+##### E. 关键交付物
+
+| 交付物 | 类型 | 描述 | 依赖 |
+|-------|------|------|------|
+| **HWAwareScheduler Plugin** | Go代码 | 调度器插件实现 | K8s 1.24+ |
+| **NUMA Cache** | Go代码 | NUMA拓扑缓存 | Device Plugin |
+| **PageCache State** | Go代码 | PageCache状态管理 | Node Agent |
+| **Scheduler Config** | YAML | 调度器配置文件 | K8s ConfigMap |
+| **NUMA Device Plugin** | Go代码 | NUMA拓扑暴露 | openEuler |
+
+---
+
+#### 2.5.3 扩展点二: 沙箱运行时管理(RuntimeClass)协同
+
+**涉及底层能力**: CoW、eSnapshot、PageCache、KSM(辅助)
+
+##### A. 技术构建架构
+
+```mermaid
+graph TB
+    subgraph "K8s运行时管理层"
+        A[RuntimeClass CRD] --> B[Runtime Manager]
+        B --> C{选择运行时}
+    end
+
+    subgraph "运行时适配层"
+        C -->|Kata Containers| D[Kata Runtime<br/>+ CoW支持]
+        C -->|Firecracker| E[Firecracker Runtime<br/>+ eSnapshot支持]
+        C -->|runc| F[runc<br/>+ PageCache共享]
+    end
+
+    subgraph "openEuler内核接口"
+        D --> G[CoW系统调用<br/>syscall_cow_fork]
+        E --> H[eSnapshot接口<br/>/dev/esnapshot]
+        F --> I[PageCache共享<br/>/proc/sys/vm/]
+    end
+
+    subgraph "容器运行时接口(CRI)"
+        G --> J[CRI扩展<br/>ForkSandbox]
+        H --> K[CRI扩展<br/>CheckpointSandbox]
+        I --> L[CRI标准<br/>CreateContainer]
+    end
+
+    style B fill:#90EE90
+    style J fill:#90EE90
+    style K fill:#90EE90
+```
+
+##### B. RuntimeClass定义
+
+```yaml
+# Kata Containers with CoW
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-openeuler-cow
+handler: kata
+overhead:
+  podFixed: "120Mi"
+scheduling:
+  nodeSelector:
+    kubernetes.io/os: linux
+    runtime: kata
+    features: cow-enabled
+---
+# Firecracker with eSnapshot
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: firecracker-openeuler-snapshot
+handler: firecracker
+overhead:
+  podFixed: "50Mi"
+scheduling:
+  nodeSelector:
+    kubernetes.io/os: linux
+    runtime: firecracker
+    features: esnapshot-enabled
+---
+# runc with PageCache sharing
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: runc-openeuler-cache
+handler: runc
+overhead:
+  podFixed: "10Mi"
+scheduling:
+  nodeSelector:
+    kubernetes.io/os: linux
+    runtime: runc
+    features: pagecache-shared
+```
+
+##### C. CRI扩展接口实现
+
+```go
+// CRI扩展接口 - 支持CoW、eSnapshot等能力
+package cri
+
+import (
+    "context"
+    "k8s.io/cri-api/pkg/apis/runtime/v1"
+)
+
+// OpenEulerRuntime 扩展CRI接口
+type OpenEulerRuntime interface {
+    // 标准CRI接口
+    v1.RuntimeServiceServer
+    v1.ImageServiceServer
+
+    // 扩展接口: CoW Fork
+    ForkSandbox(ctx context.Context, req *ForkSandboxRequest) (*ForkSandboxResponse, error)
+
+    // 扩展接口: eSnapshot快照
+    CheckpointSandbox(ctx context.Context, req *CheckpointSandboxRequest) (*CheckpointSandboxResponse, error)
+
+    // 扩展接口: 从快照恢复
+    RestoreSandbox(ctx context.Context, req *RestoreSandboxRequest) (*RestoreSandboxResponse, error)
+
+    // 扩展接口: PageCache共享
+    SharePageCache(ctx context.Context, req *SharePageCacheRequest) (*SharePageCacheResponse, error)
+}
+
+// ForkSandboxRequest - CoW Fork请求
+type ForkSandboxRequest struct {
+    ParentSandboxID string            `json:"parentSandboxId"`
+    Options         ForkOptions       `json:"options"`
+}
+
+type ForkOptions struct {
+    ShareMemory    bool              `json:"shareMemory"`    // 启用CoW
+    SharePageCache bool              `json:"sharePageCache"` // 共享PageCache
+    ShareNetwork   bool              `json:"shareNetwork"`   // 共享网络命名空间
+}
+
+type ForkSandboxResponse struct {
+    SandboxID  string `json:"sandboxId"`
+    ForkTime   int64  `json:"forkTime"`   // 毫秒
+    MemorySaved int64 `json:"memorySaved"` // 节省的字节数
+}
+
+// CheckpointSandboxRequest - eSnapshot快照请求
+type CheckpointSandboxRequest struct {
+    SandboxID     string              `json:"sandboxId"`
+    OutputPath    string              `json:"outputPath"`
+    Options       CheckpointOptions   `json:"options"`
+}
+
+type CheckpointOptions struct {
+    LeaveRunning  bool   `json:"leaveRunning"`  // 保持运行
+    Incremental   bool   `json:"incremental"`   // 增量快照
+    Compression   string `json:"compression"`   // 压缩算法: none, gzip, zstd
+}
+
+type CheckpointSandboxResponse struct {
+    SnapshotPath string `json:"snapshotPath"`
+    SnapshotSize int64  `json:"snapshotSize"`  // 字节数
+    CheckpointTime int64 `json:"checkpointTime"` // 毫秒
+}
+
+// Kata Runtime实现
+type KataRuntime struct {
+    client *kata.Client
+}
+
+func (k *KataRuntime) ForkSandbox(ctx context.Context, req *ForkSandboxRequest) (*ForkSandboxResponse, error) {
+    startTime := time.Now()
+
+    // 1. 获取父沙箱
+    parent, err := k.client.GetSandbox(req.ParentSandboxID)
+    if err != nil {
+        return nil, err
+    }
+
+    // 2. 调用openEuler CoW系统调用
+    forkConfig := &kata.ForkConfig{
+        ShareMemory:    req.Options.ShareMemory,
+        SharePageCache: req.Options.SharePageCache,
+        ShareNetwork:   req.Options.ShareNetwork,
+    }
+
+    childID, err := k.client.CowFork(parent.ID, forkConfig)
+    if err != nil {
+        return nil, err
+    }
+
+    // 3. 计算节省的内存
+    memorySaved := k.calculateMemorySaved(parent.ID, childID)
+
+    return &ForkSandboxResponse{
+        SandboxID:   childID,
+        ForkTime:    time.Since(startTime).Milliseconds(),
+        MemorySaved: memorySaved,
+    }, nil
+}
+
+func (k *KataRuntime) CheckpointSandbox(ctx context.Context, req *CheckpointSandboxRequest) (*CheckpointSandboxResponse, error) {
+    startTime := time.Now()
+
+    // 1. 调用openEuler eSnapshot接口
+    snapConfig := &kata.CheckpointConfig{
+        OutputPath:   req.OutputPath,
+        LeaveRunning: req.Options.LeaveRunning,
+        Incremental:  req.Options.Incremental,
+        Compression:  req.Options.Compression,
+    }
+
+    snapshotPath, snapshotSize, err := k.client.EsnapshotCreate(req.SandboxID, snapConfig)
+    if err != nil {
+        return nil, err
+    }
+
+    return &CheckpointSandboxResponse{
+        SnapshotPath:   snapshotPath,
+        SnapshotSize:   snapshotSize,
+        CheckpointTime: time.Since(startTime).Milliseconds(),
+    }, nil
+}
+```
+
+##### D. Runtime Manager实现
+
+```go
+// Runtime Manager - 管理多种运行时
+package runtime
+
+import (
+    "context"
+    "k8s.io/apimachinery/pkg/types"
+)
+
+type RuntimeManager struct {
+    runtimes map[string]OpenEulerRuntime // runtimeClass -> runtime
+}
+
+// 选择合适的运行时
+func (m *RuntimeManager) SelectRuntime(pod *v1.Pod) (OpenEulerRuntime, error) {
+    runtimeClassName := pod.Spec.RuntimeClassName
+    if runtimeClassName == nil {
+        return m.runtimes["runc"], nil // 默认runc
+    }
+
+    runtime, exists := m.runtimes[*runtimeClassName]
+    if !exists {
+        return nil, fmt.Errorf("runtime class %s not found", *runtimeClassName)
+    }
+
+    return runtime, nil
+}
+
+// Fork沙箱 - 根据RuntimeClass选择策略
+func (m *RuntimeManager) ForkSandbox(
+    ctx context.Context,
+    parentSandboxID string,
+    pod *v1.Pod,
+) (string, error) {
+    runtime, err := m.SelectRuntime(pod)
+    if err != nil {
+        return "", err
+    }
+
+    // 根据RuntimeClass选择Fork策略
+    var forkOptions ForkOptions
+    switch pod.Spec.RuntimeClassName {
+    case "kata-openeuler-cow":
+        // Kata: 启用CoW + PageCache共享
+        forkOptions = ForkOptions{
+            ShareMemory:    true,
+            SharePageCache: true,
+            ShareNetwork:   false,
+        }
+    case "firecracker-openeuler-snapshot":
+        // Firecracker: 需要先快照再恢复
+        return m.forkViaSnapshot(ctx, parentSandboxID, pod, runtime)
+    default:
+        // runc: 仅PageCache共享
+        forkOptions = ForkOptions{
+            ShareMemory:    false,
+            SharePageCache: true,
+            ShareNetwork:   false,
+        }
+    }
+
+    resp, err := runtime.ForkSandbox(ctx, &ForkSandboxRequest{
+        ParentSandboxID: parentSandboxID,
+        Options:         forkOptions,
+    })
+    if err != nil {
+        return "", err
+    }
+
+    // 记录指标
+    m.recordForkMetrics(resp.ForkTime, resp.MemorySaved)
+
+    return resp.SandboxID, nil
+}
+
+// 通过快照方式Fork(用于Firecracker)
+func (m *RuntimeManager) forkViaSnapshot(
+    ctx context.Context,
+    parentSandboxID string,
+    pod *v1.Pod,
+    runtime OpenEulerRuntime,
+) (string, error) {
+    // 1. 创建快照
+    snapshotPath := fmt.Sprintf("/var/lib/sandbox-snapshots/%s", parentSandboxID)
+    checkpointResp, err := runtime.CheckpointSandbox(ctx, &CheckpointSandboxRequest{
+        SandboxID:  parentSandboxID,
+        OutputPath: snapshotPath,
+        Options: CheckpointOptions{
+            LeaveRunning: true,
+            Incremental:  true,
+            Compression:  "zstd",
+        },
+    })
+    if err != nil {
+        return "", err
+    }
+
+    // 2. 从快照恢复
+    restoreResp, err := runtime.RestoreSandbox(ctx, &RestoreSandboxRequest{
+        SnapshotPath: checkpointResp.SnapshotPath,
+    })
+    if err != nil {
+        return "", err
+    }
+
+    return restoreResp.SandboxID, nil
+}
+```
+
+##### E. 协同流程
+
+```mermaid
+sequenceDiagram
+    participant Controller
+    participant Runtime Manager
+    participant RuntimeClass
+    participant CRI
+    participant openEuler Kernel
+
+    Controller->>Runtime Manager: ForkSandbox(parentID, pod)
+    Runtime Manager->>RuntimeClass: 查询RuntimeClass
+    RuntimeClass-->>Runtime Manager: 返回运行时配置
+
+    alt Kata with CoW
+        Runtime Manager->>CRI: ForkSandbox(shareMemory=true)
+        CRI->>openEuler Kernel: syscall_cow_fork()
+        openEuler Kernel->>openEuler Kernel: 创建CoW映射
+        openEuler Kernel-->>CRI: 返回子沙箱ID
+        CRI-->>Runtime Manager: ForkSandboxResponse(<100ms)
+    else Firecracker with eSnapshot
+        Runtime Manager->>CRI: CheckpointSandbox()
+        CRI->>openEuler Kernel: /dev/esnapshot ioctl
+        openEuler Kernel-->>CRI: 快照路径
+        Runtime Manager->>CRI: RestoreSandbox()
+        CRI->>openEuler Kernel: 从快照恢复
+        openEuler Kernel-->>CRI: 子沙箱ID
+        CRI-->>Runtime Manager: RestoreSandboxResponse(<1s)
+    else runc with PageCache
+        Runtime Manager->>CRI: ForkSandbox(sharePageCache=true)
+        CRI->>openEuler Kernel: 共享PageCache
+        openEuler Kernel-->>CRI: 子沙箱ID
+        CRI-->>Runtime Manager: ForkSandboxResponse(<500ms)
+    end
+
+    Runtime Manager-->>Controller: 返回子沙箱ID
+```
+
+##### F. 关键交付物
+
+| 交付物 | 类型 | 描述 | 依赖 |
+|-------|------|------|------|
+| **RuntimeClass定义** | YAML | 3种运行时配置 | K8s 1.20+ |
+| **CRI扩展接口** | Go代码 | Fork/Checkpoint扩展 | containerd/CRI-O |
+| **Kata Runtime适配** | Go代码 | Kata CoW集成 | Kata Containers 2.0+ |
+| **Firecracker适配** | Go代码 | eSnapshot集成 | Firecracker 1.0+ |
+| **Runtime Manager** | Go代码 | 运行时管理器 | OpenKruise |
+
+---
+
+#### 2.5.4 扩展点三: 沙箱预热池管理(Pool Manager)协同
+
+**涉及底层能力**: KSM、PageCache、eSnapshot(辅助)、镜像预热
+
+##### A. 技术构建架构
+
+```mermaid
+graph TB
+    subgraph "预热池管理层"
+        A[SandboxSet CRD] --> B[Pool Manager Controller]
+        B --> C{预热策略决策}
+    end
+
+    subgraph "预热策略层"
+        C --> D[ML预测预热]
+        C --> E[KSM内存优化预热]
+        C --> F[PageCache共享预热]
+        C --> G[eSnapshot快照预热]
+    end
+
+    subgraph "执行层"
+        D --> H[Image Preheater]
+        E --> I[KSM Manager]
+        F --> J[PageCache Agent]
+        G --> K[Snapshot Creator]
+    end
+
+    subgraph "openEuler内核"
+        H --> L[镜像缓存]
+        I --> M[内存合并]
+        J --> N[PageCache共享]
+        K --> O[eSnapshot存储]
+    end
+
+    subgraph "预热池"
+        L --> P[热沙箱池<br/>完全就绪]
+        M --> Q[内存优化池<br/>KSM合并]
+        N --> R[缓存共享池<br/>PageCache共享]
+        O --> S[快照池<br/>快速恢复]
+    end
+
+    style B fill:#90EE90
+    style P fill:#90EE90
+    style Q fill:#90EE90
+    style R fill:#90EE90
+    style S fill:#90EE90
+```
+
+##### B. SandboxSet CRD扩展
+
+```yaml
+# SandboxSet with Pool Enhancement
+apiVersion: agents.kruise.io/v1alpha1
+kind: SandboxSet
+metadata:
+  name: python-pool
+spec:
+  replicas: 50  # 预热50个沙箱
+
+  # 池化策略增强
+  poolStrategy:
+    # 分层预热策略
+    tiers:
+    - name: hot
+      replicas: 10  # 热池: 10个完全就绪
+      requirements:
+        memory: "2Gi"
+        cpu: "1"
+    - name: warm
+      replicas: 20  # 温池: 20个部分就绪
+      requirements:
+        memory: "1Gi"  # KSM合并后
+        cpu: "500m"
+    - name: cold
+      replicas: 20  # 冷池: 20个资源预留
+      requirements:
+        memory: "0"  # 仅快照存储
+
+    # KSM优化配置
+    ksmConfig:
+      enabled: true
+      aggressiveMode: true  # 激进模式: 快速合并
+      sleepMillisecs: 100
+      pagesToScan: 1000
+
+    # PageCache共享配置
+    pageCacheConfig:
+      enabled: true
+      shareAcrossPools: true  # 跨池共享
+
+    # eSnapshot快照池配置
+    snapshotConfig:
+      enabled: true
+      incrementalSnapshots: true  # 增量快照
+      compression: zstd
+      storageClass: fast-ssd
+
+  # ML预测预热
+  preheatStrategy:
+    type: Predictive
+    predictor:
+      model: LSTM
+      lookAhead: 1h  # 预测未来1小时
+      minReplicas: 10
+      maxReplicas: 100
+
+  template:
+    spec:
+      runtimeClassName: kata-openeuler-cow
+      containers:
+      - name: python
+        image: python:3.11-slim
+```
+
+##### C. Pool Manager Controller实现
+
+```go
+// Pool Manager Controller - 增强预热池管理
+package controller
+
+import (
+    "context"
+    "github.com/openkruise/kruise-api/agents/v1alpha1"
+)
+
+type PoolManagerController struct {
+    client        client.Client
+    ksmManager    *KSMManager
+    pageCacheMgr  *PageCacheManager
+    snapshotMgr   *SnapshotManager
+    predictor     *MLPredictor
+}
+
+func (r *PoolManagerController) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    sandboxSet := &v1alpha1.SandboxSet{}
+    if err := r.Get(ctx, req.NamespacedName, sandboxSet); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
+
+    // 1. ML预测预热
+    if sandboxSet.Spec.PreheatStrategy.Type == "Predictive" {
+        predictedReplicas := r.predictor.Predict(ctx, sandboxSet)
+        r.adjustPoolSize(ctx, sandboxSet, predictedReplicas)
+    }
+
+    // 2. 分层池化管理
+    r.manageTieredPool(ctx, sandboxSet)
+
+    // 3. KSM内存优化
+    if sandboxSet.Spec.PoolStrategy.KSMConfig.Enabled {
+        r.optimizeKSMMemory(ctx, sandboxSet)
+    }
+
+    // 4. PageCache共享
+    if sandboxSet.Spec.PoolStrategy.PageCacheConfig.Enabled {
+        r.sharePageCache(ctx, sandboxSet)
+    }
+
+    // 5. eSnapshot快照池
+    if sandboxSet.Spec.PoolStrategy.SnapshotConfig.Enabled {
+        r.manageSnapshotPool(ctx, sandboxSet)
+    }
+
+    return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
+}
+
+// 分层池化管理
+func (r *PoolManagerController) manageTieredPool(ctx context.Context, sandboxSet *v1alpha1.SandboxSet) {
+    tiers := sandboxSet.Spec.PoolStrategy.Tiers
+
+    for _, tier := range tiers {
+        switch tier.Name {
+        case "hot":
+            // 热池: 完全就绪的沙箱
+            r.manageHotPool(ctx, sandboxSet, tier)
+        case "warm":
+            // 温池: KSM合并后的沙箱
+            r.manageWarmPool(ctx, sandboxSet, tier)
+        case "cold":
+            // 冷池: 快照存储
+            r.manageColdPool(ctx, sandboxSet, tier)
+        }
+    }
+}
+
+// 热池管理: 完全就绪
+func (r *PoolManagerController) manageHotPool(ctx context.Context, sandboxSet *v1alpha1.SandboxSet, tier v1alpha1.PoolTier) {
+    currentReplicas := r.countRunningSandboxes(sandboxSet)
+    desiredReplicas := tier.Replicas
+
+    if currentReplicas < desiredReplicas {
+        // 从温池提升到热池
+        for i := 0; i < desiredReplicas-currentReplicas; i++ {
+            r.promoteFromWarmPool(ctx, sandboxSet)
+        }
+    } else if currentReplicas > desiredReplicas {
+        // 降级到温池
+        for i := 0; i < currentReplicas-desiredReplicas; i++ {
+            r.demoteToWarmPool(ctx, sandboxSet)
+        }
+    }
+}
+
+// KSM内存优化
+func (r *PoolManagerController) optimizeKSMMemory(ctx context.Context, sandboxSet *v1alpha1.SandboxSet) {
+    ksmConfig := sandboxSet.Spec.PoolStrategy.KSMConfig
+
+    // 1. 获取池中所有沙箱的内存统计
+    sandboxes := r.listPoolSandboxes(sandboxSet)
+    memoryStats := r.ksmManager.GetMemoryStats(sandboxes)
+
+    // 2. 动态调整KSM参数
+    if ksmConfig.AggressiveMode {
+        // 激进模式: 快速合并
+        r.ksmManager.SetAggressiveMode()
+    }
+
+    // 3. 监控合并效果
+    mergeRatio := r.ksmManager.GetMergeRatio(sandboxes)
+    r.recordKSMMetrics(mergeRatio, memoryStats.Saved)
+
+    // 4. 调整温池大小(基于KSM效果)
+    if mergeRatio > 0.7 {  // 合并率>70%
+        // KSM效果好,可以扩大温池
+        r.expandWarmPool(ctx, sandboxSet)
+    }
+}
+
+// PageCache共享
+func (r *PoolManagerController) sharePageCache(ctx context.Context, sandboxSet *v1alpha1.SandboxSet) {
+    pageCacheConfig := sandboxSet.Spec.PoolStrategy.PageCacheConfig
+
+    if !pageCacheConfig.ShareAcrossPools {
+        return
+    }
+
+    // 1. 识别相同镜像的沙箱
+    sandboxes := r.listPoolSandboxes(sandboxSet)
+    imageGroups := r.groupByImage(sandboxes)
+
+    // 2. 为每个镜像组建立PageCache共享
+    for image, group := range imageGroups {
+        if len(group) > 1 {
+            // 多个沙箱共享相同镜像的PageCache
+            r.pageCacheMgr.EstablishSharing(group)
+        }
+    }
+
+    // 3. 记录缓存命中率
+    hitRate := r.pageCacheMgr.GetHitRate(sandboxSet.Name)
+    r.recordPageCacheMetrics(hitRate)
+}
+
+// eSnapshot快照池管理
+func (r *PoolManagerController) manageSnapshotPool(ctx context.Context, sandboxSet *v1alpha1.SandboxSet) {
+    snapshotConfig := sandboxSet.Spec.PoolStrategy.SnapshotConfig
+
+    // 1. 创建快照池
+    coldPoolSize := r.getColdPoolSize(sandboxSet)
+    existingSnapshots := r.listSnapshots(sandboxSet)
+
+    if len(existingSnapshots) < coldPoolSize {
+        // 需要创建更多快照
+        for i := 0; i < coldPoolSize-len(existingSnapshots); i++ {
+            r.createSnapshot(ctx, sandboxSet, snapshotConfig)
+        }
+    }
+
+    // 2. 增量快照更新
+    if snapshotConfig.IncrementalSnapshots {
+        r.updateIncrementalSnapshots(ctx, sandboxSet)
+    }
+}
+
+// 创建快照
+func (r *PoolManagerController) createSnapshot(
+    ctx context.Context,
+    sandboxSet *v1alpha1.SandboxSet,
+    config v1alpha1.SnapshotConfig,
+) error {
+    // 1. 从温池选择一个沙箱
+    sandbox := r.selectSandboxFromWarmPool(sandboxSet)
+    if sandbox == nil {
+        return fmt.Errorf("no sandbox available in warm pool")
+    }
+
+    // 2. 创建eSnapshot快照
+    snapshotPath := fmt.Sprintf("/var/lib/sandbox-snapshots/%s/%s", sandboxSet.Name, sandbox.Name)
+    err := r.snapshotMgr.CreateSnapshot(ctx, sandbox, snapshotPath, config)
+    if err != nil {
+        return err
+    }
+
+    // 3. 记录快照元数据
+    r.recordSnapshotMetadata(sandboxSet.Name, sandbox.Name, snapshotPath)
+
+    return nil
+}
+```
+
+##### D. ML预测预热实现
+
+```python
+# ML预测预热模型
+import tensorflow as tf
+import numpy as np
+from prometheus_api_client import PrometheusConnect
+
+class SandboxDemandPredictor:
+    def __init__(self, model_path):
+        self.model = tf.keras.models.load_model(model_path)
+        self.prometheus = PrometheusConnect(url="http://prometheus:9090")
+
+    def predict(self, sandboxset_name, look_ahead_hours=1):
+        # 1. 从Prometheus获取历史数据
+        historical_data = self.fetch_historical_data(sandboxset_name)
+
+        # 2. 特征工程
+        features = self.extract_features(historical_data)
+
+        # 3. LSTM预测
+        predicted_demand = self.model.predict(features)
+
+        # 4. 计算需要预热的沙箱数量
+        current_replicas = self.get_current_replicas(sandboxset_name)
+        predicted_replicas = int(predicted_demand[0] * 1.2)  # 预留20%buffer
+
+        return max(predicted_replicas, current_replicas)
+
+    def fetch_historical_data(self, sandboxset_name):
+        # 从Prometheus获取过去7天的数据
+        metric_name = f'sandbox_pool_demand{{sandboxset="{sandboxset_name}"}}'
+        data = self.prometheus.custom_query_range(
+            query=metric_name,
+            start_time=datetime.now() - timedelta(days=7),
+            end_time=datetime.now(),
+            step="1h"
+        )
+        return data
+
+    def extract_features(self, historical_data):
+        # 特征工程:
+        # - 小时级需求模式
+        # - 日级需求模式
+        # - 周级需求模式
+        features = []
+        for point in historical_data:
+            hour = point['timestamp'].hour
+            day_of_week = point['timestamp'].weekday()
+            demand = float(point['value'])
+
+            features.append([
+                hour / 24.0,  # 归一化小时
+                day_of_week / 7.0,  # 归一化星期
+                demand
+            ])
+
+        return np.array(features).reshape(1, -1, 3)
+```
+
+##### E. 协同流程
+
+```mermaid
+sequenceDiagram
+    participant Timer
+    participant Pool Manager
+    participant ML Predictor
+    participant KSM Manager
+    participant PageCache Agent
+    participant Snapshot Manager
+
+    Timer->>Pool Manager: 定时触发(每分钟)
+    Pool Manager->>ML Predictor: 预测未来1小时需求
+    ML Predictor-->>Pool Manager: 返回预测结果
+
+    Note over Pool Manager: 1. 调整池大小
+    Pool Manager->>Pool Manager: 调整热池/温池/冷池比例
+
+    Note over Pool Manager: 2. KSM内存优化
+    Pool Manager->>KSM Manager: 启用激进模式
+    KSM Manager->>KSM Manager: 扫描并合并内存页
+    KSM Manager-->>Pool Manager: 合并率>70%
+
+    Note over Pool Manager: 3. PageCache共享
+    Pool Manager->>PageCache Agent: 建立共享映射
+    PageCache Agent->>PageCache Agent: 识别相同镜像
+    PageCache Agent-->>Pool Manager: 缓存命中率>90%
+
+    Note over Pool Manager: 4. 快照池维护
+    Pool Manager->>Snapshot Manager: 创建增量快照
+    Snapshot Manager->>Snapshot Manager: eSnapshot快照
+    Snapshot Manager-->>Pool Manager: 快照就绪
+
+    Pool Manager->>Pool Manager: 更新SandboxSet状态
+```
+
+##### F. 关键交付物
+
+| 交付物 | 类型 | 描述 | 依赖 |
+|-------|------|------|------|
+| **SandboxSet CRD扩展** | Go代码 | 分层池化、KSM、PageCache、快照配置 | OpenKruise |
+| **Pool Manager Controller** | Go代码 | 增强预热池管理控制器 | K8s Controller |
+| **KSM Manager** | Go代码 | KSM内存优化管理器 | openEuler KSM |
+| **PageCache Agent** | Go代码 | PageCache共享代理 | openEuler内核 |
+| **Snapshot Manager** | Go代码 | eSnapshot快照管理器 | openEuler eSnapshot |
+| **ML Predictor** | Python | LSTM预测模型 | TensorFlow |
+| **Prometheus Exporter** | Go代码 | 池化指标导出 | Prometheus |
+
+---
+
+#### 2.5.5 三大扩展点协同总结
+
+**协同架构全景**:
+
+```mermaid
+graph TB
+    subgraph "用户请求"
+        A[智能体沙箱请求]
+    end
+
+    subgraph "扩展点一: 集群调度"
+        A --> B[HW-Aware Scheduler]
+        B -->|NUMA亲和| C[节点选择]
+        B -->|PageCache命中率| C
+        B -->|Remote-Fork可行性| C
+    end
+
+    subgraph "扩展点二: 运行时管理"
+        C --> D[Runtime Manager]
+        D -->|RuntimeClass| E{选择运行时}
+        E -->|Kata CoW| F[CoW Fork]
+        E -->|Firecracker eSnapshot| G[快照恢复]
+        E -->|runc PageCache| H[缓存共享]
+    end
+
+    subgraph "扩展点三: 预热池管理"
+        B --> I[Pool Manager]
+        I -->|ML预测| J[调整池大小]
+        I -->|KSM优化| K[内存合并]
+        I -->|PageCache共享| L[缓存预热]
+        I -->|eSnapshot| M[快照池]
+    end
+
+    subgraph "openEuler底层能力"
+        F --> N[CoW内核接口]
+        G --> O[eSnapshot接口]
+        H --> P[PageCache共享]
+        K --> Q[KSM内核模块]
+        M --> O
+    end
+
+    style B fill:#90EE90
+    style D fill:#90EE90
+    style I fill:#90EE90
+```
+
+**关键协同点**:
+
+| 协同点 | 调度器 | 运行时 | 预热池 | 底层能力 | 协同效果 |
+|-------|--------|--------|--------|---------|---------|
+| **启动优化** | PageCache命中评分 | PageCache共享 | PageCache预热 | PageCache | **启动<1秒** |
+| **Fork能力** | Remote-Fork节点选择 | CoW/eSnapshot | 快照池 | CoW/eSnapshot | **Fork<100ms** |
+| **内存效率** | NUMA亲和 | KSM辅助 | KSM优化 | KSM | **内存-70%** |
+| **跨节点** | Remote-Fork调度 | eSnapshot恢复 | 快照池 | eSnapshot+RDMA | **迁移3-6秒** |
+
+**实施优先级**:
+
+| 优先级 | 扩展点 | 底层能力 | 实施难度 | 收益 | 时间 |
+|-------|--------|---------|---------|------|------|
+| **P0** | 预热池管理 | KSM + PageCache | 低 | 内存-70%、启动<1秒 | 3个月 |
+| **P1** | 运行时管理 | CoW | 中 | Fork<100ms | 6个月 |
+| **P2** | 集群调度 | NUMA + PageCache | 中 | 并发+3倍 | 6个月 |
+| **P3** | 运行时+调度 | eSnapshot + Remote-Fork | 高 | 跨节点<500ms | 12个月 |
 
 ---
 
