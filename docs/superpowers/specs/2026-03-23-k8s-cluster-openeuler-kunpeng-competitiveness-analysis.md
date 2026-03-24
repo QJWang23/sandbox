@@ -1002,10 +1002,137 @@ func (k *KataRuntime) CheckpointSandbox(ctx context.Context, req *CheckpointSand
 }
 ```
 
-##### D. Runtime Manager实现
+##### D. RuntimeClass使用场景与选择策略
+
+**重要澄清**: 在实际生产环境中，**RuntimeClass的选择应该在SandboxSet/Template层面确定，而不是在运行时动态决策**。一个SandboxSet内的所有沙箱实例应该使用相同的RuntimeClass。
+
+**不同RuntimeClass的适用场景**:
+
+| RuntimeClass | 适用场景 | 隔离级别 | 性能 | 典型业务 |
+|-------------|---------|---------|------|---------|
+| **kata-openeuler-cow** | 多租户、安全敏感、需要强隔离 | 最高(独立VM内核) | 中 | 代码执行平台、在线IDE、金融交易 |
+| **firecracker-openeuler-snapshot** | 无服务器、短生命周期、高密度 | 高(微虚拟机) | 高 | 函数计算、事件驱动、临时任务 |
+| **runc-openeuler-cache** | 内部服务、性能敏感、信任环境 | 低(共享内核) | 最高 | 内部工具、批处理、性能测试 |
+
+**集群层面混用策略**:
+
+```mermaid
+graph TB
+    subgraph "K8s集群"
+        subgraph "节点池A: Kata节点"
+            A1[Node 1<br/>Kata Runtime]
+            A2[Node 2<br/>Kata Runtime]
+        end
+
+        subgraph "节点池B: Firecracker节点"
+            B1[Node 3<br/>Firecracker Runtime]
+            B2[Node 4<br/>Firecracker Runtime]
+        end
+
+        subgraph "节点池C: runc节点"
+            C1[Node 5<br/>runc Runtime]
+            C2[Node 6<br/>runc Runtime]
+        end
+    end
+
+    subgraph "SandboxSet(业务隔离)"
+        D1[SandboxSet: code-exec<br/>RuntimeClass: kata-openeuler-cow]
+        D2[SandboxSet: function-compute<br/>RuntimeClass: firecracker-openeuler-snapshot]
+        D3[SandboxSet: internal-tools<br/>RuntimeClass: runc-openeuler-cache]
+    end
+
+    D1 -->|nodeSelector: runtime=kata| A1
+    D1 --> A2
+    D2 -->|nodeSelector: runtime=firecracker| B1
+    D2 --> B2
+    D3 -->|nodeSelector: runtime=runc| C1
+    D3 --> C2
+
+    style D1 fill:#90EE90
+    style D2 fill:#87CEEB
+    style D3 fill:#FFB6C1
+```
+
+**关键原则**:
+1. **每个SandboxSet固定一个RuntimeClass** - 在创建时确定，整个生命周期不变
+2. **集群可以混用多个RuntimeClass** - 通过不同的SandboxSet隔离
+3. **节点池按RuntimeClass划分** - 避免同一节点运行多种runtime
+4. **调度器根据nodeSelector分配** - 确保沙箱调度到���确的节点池
+
+##### E. SandboxSet与RuntimeClass绑定示例
+
+```yaml
+# SandboxSet 1: 代码执行平台 - 使用Kata(强隔离)
+apiVersion: agents.kruise.io/v1alpha1
+kind: SandboxSet
+metadata:
+  name: code-execution-pool
+spec:
+  replicas: 50
+  template:
+    spec:
+      # 固定使用Kata RuntimeClass
+      runtimeClassName: kata-openeuler-cow
+      nodeSelector:
+        runtime: kata
+        hardware: kunpeng
+      containers:
+      - name: code-executor
+        image: python:3.11-slim
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1"
+---
+# SandboxSet 2: 函数计算 - 使用Firecracker(高密度)
+apiVersion: agents.kruise.io/v1alpha1
+kind: SandboxSet
+metadata:
+  name: function-compute-pool
+spec:
+  replicas: 200  # 高密度部署
+  template:
+    spec:
+      # 固定使用Firecracker RuntimeClass
+      runtimeClassName: firecracker-openeuler-snapshot
+      nodeSelector:
+        runtime: firecracker
+      containers:
+      - name: function-runner
+        image: node:18-alpine
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+---
+# SandboxSet 3: 内部工具 - 使用runc(高性能)
+apiVersion: agents.kruise.io/v1alpha1
+kind: SandboxSet
+metadata:
+  name: internal-tools-pool
+spec:
+  replicas: 20
+  template:
+    spec:
+      # 固定使用runc RuntimeClass
+      runtimeClassName: runc-openeuler-cache
+      nodeSelector:
+        runtime: runc
+      containers:
+      - name: tool-runner
+        image: alpine:3.18
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+```
+
+##### F. Runtime Manager实现(简化版)
+
+**重要变更**: Runtime Manager不需要动态选择runtime，而是根据SandboxSet的固定配置调用对应的runtime接口。
 
 ```go
-// Runtime Manager - 管理多种运行时
+// Runtime Manager - 简化版，不需要动态决策
 package runtime
 
 import (
@@ -1017,83 +1144,81 @@ type RuntimeManager struct {
     runtimes map[string]OpenEulerRuntime // runtimeClass -> runtime
 }
 
-// 选择合适的运行时
-func (m *RuntimeManager) SelectRuntime(pod *v1.Pod) (OpenEulerRuntime, error) {
-    runtimeClassName := pod.Spec.RuntimeClassName
-    if runtimeClassName == nil {
-        return m.runtimes["runc"], nil // 默认runc
-    }
-
-    runtime, exists := m.runtimes[*runtimeClassName]
+// GetRuntime - 获取SandboxSet指定的Runtime
+// 注意: RuntimeClass在SandboxSet创建时已确定，这里只是获取对应的runtime实现
+func (m *RuntimeManager) GetRuntime(runtimeClassName string) (OpenEulerRuntime, error) {
+    runtime, exists := m.runtimes[runtimeClassName]
     if !exists {
-        return nil, fmt.Errorf("runtime class %s not found", *runtimeClassName)
+        return nil, fmt.Errorf("runtime class %s not found", runtimeClassName)
     }
-
     return runtime, nil
 }
 
-// Fork沙箱 - 根据RuntimeClass选择策略
+// ForkSandbox - 根据SandboxSet的RuntimeClass执行Fork
 func (m *RuntimeManager) ForkSandbox(
     ctx context.Context,
     parentSandboxID string,
-    pod *v1.Pod,
+    runtimeClassName string,
 ) (string, error) {
-    runtime, err := m.SelectRuntime(pod)
+    // 1. 获取SandboxSet指定的runtime
+    runtime, err := m.GetRuntime(runtimeClassName)
     if err != nil {
         return "", err
     }
 
-    // 根据RuntimeClass选择Fork策略
-    var forkOptions ForkOptions
-    switch pod.Spec.RuntimeClassName {
+    // 2. 根据runtime类型使用对应的Fork策略
+    // 注意: 这里是根据runtime类型分支，而不是动态决策
+    switch runtimeClassName {
     case "kata-openeuler-cow":
-        // Kata: 启用CoW + PageCache共享
-        forkOptions = ForkOptions{
-            ShareMemory:    true,
-            SharePageCache: true,
-            ShareNetwork:   false,
-        }
+        // Kata: 使用CoW Fork
+        return m.forkWithCoW(ctx, parentSandboxID, runtime)
     case "firecracker-openeuler-snapshot":
-        // Firecracker: 需要先快照再恢复
-        return m.forkViaSnapshot(ctx, parentSandboxID, pod, runtime)
+        // Firecracker: 使用eSnapshot Fork
+        return m.forkWithSnapshot(ctx, parentSandboxID, runtime)
+    case "runc-openeuler-cache":
+        // runc: 使用PageCache共享
+        return m.forkWithPageCache(ctx, parentSandboxID, runtime)
     default:
-        // runc: 仅PageCache共享
-        forkOptions = ForkOptions{
-            ShareMemory:    false,
-            SharePageCache: true,
-            ShareNetwork:   false,
-        }
+        return "", fmt.Errorf("unsupported runtime class: %s", runtimeClassName)
     }
+}
 
+// Kata CoW Fork实现
+func (m *RuntimeManager) forkWithCoW(
+    ctx context.Context,
+    parentSandboxID string,
+    runtime OpenEulerRuntime,
+) (string, error) {
     resp, err := runtime.ForkSandbox(ctx, &ForkSandboxRequest{
         ParentSandboxID: parentSandboxID,
-        Options:         forkOptions,
+        Options: ForkOptions{
+            ShareMemory:    true,  // Kata支持CoW
+            SharePageCache: true,  // 共享PageCache
+            ShareNetwork:   false,
+        },
     })
     if err != nil {
         return "", err
     }
 
-    // 记录指标
-    m.recordForkMetrics(resp.ForkTime, resp.MemorySaved)
-
+    m.recordForkMetrics(resp.ForkTime, resp.MemorySaved, "cow")
     return resp.SandboxID, nil
 }
 
-// 通过快照方式Fork(用于Firecracker)
-func (m *RuntimeManager) forkViaSnapshot(
+// Firecracker eSnapshot Fork实现
+func (m *RuntimeManager) forkWithSnapshot(
     ctx context.Context,
     parentSandboxID string,
-    pod *v1.Pod,
     runtime OpenEulerRuntime,
 ) (string, error) {
-    // 1. 创建快照
-    snapshotPath := fmt.Sprintf("/var/lib/sandbox-snapshots/%s", parentSandboxID)
+    // 1. 创建eSnapshot快照
+    snapshotPath := fmt.Sprintf("/var/lib/sandbox-snapshots/%s.snap", parentSandboxID)
     checkpointResp, err := runtime.CheckpointSandbox(ctx, &CheckpointSandboxRequest{
         SandboxID:  parentSandboxID,
         OutputPath: snapshotPath,
         Options: CheckpointOptions{
             LeaveRunning: true,
-            Incremental:  true,
+            Incremental:  true,  // Firecracker支持增量快照
             Compression:  "zstd",
         },
     })
@@ -1101,7 +1226,7 @@ func (m *RuntimeManager) forkViaSnapshot(
         return "", err
     }
 
-    // 2. 从快照恢复
+    // 2. 从快照恢复新沙箱
     restoreResp, err := runtime.RestoreSandbox(ctx, &RestoreSandboxRequest{
         SnapshotPath: checkpointResp.SnapshotPath,
     })
@@ -1109,31 +1234,58 @@ func (m *RuntimeManager) forkViaSnapshot(
         return "", err
     }
 
+    m.recordForkMetrics(checkpointResp.CheckpointTime, 0, "snapshot")
     return restoreResp.SandboxID, nil
+}
+
+// runc PageCache共享Fork实现
+func (m *RuntimeManager) forkWithPageCache(
+    ctx context.Context,
+    parentSandboxID string,
+    runtime OpenEulerRuntime,
+) (string, error) {
+    resp, err := runtime.ForkSandbox(ctx, &ForkSandboxRequest{
+        ParentSandboxID: parentSandboxID,
+        Options: ForkOptions{
+            ShareMemory:    false, // runc不支持CoW
+            SharePageCache: true,  // 仅共享PageCache
+            ShareNetwork:   false,
+        },
+    })
+    if err != nil {
+        return "", err
+    }
+
+    m.recordForkMetrics(resp.ForkTime, resp.MemorySaved, "pagecache")
+    return resp.SandboxID, nil
 }
 ```
 
-##### E. 协同流程
+##### G. 协同流程
 
 ```mermaid
 sequenceDiagram
-    participant Controller
+    participant User
+    participant SandboxSet
     participant Runtime Manager
-    participant RuntimeClass
     participant CRI
     participant openEuler Kernel
+    participant Node Pool
 
-    Controller->>Runtime Manager: ForkSandbox(parentID, pod)
-    Runtime Manager->>RuntimeClass: 查询RuntimeClass
-    RuntimeClass-->>Runtime Manager: 返回运行时配置
+    User->>SandboxSet: 请求沙箱
+    Note over SandboxSet: RuntimeClass已在创建时确定<br/>例如: kata-openeuler-cow
+    SandboxSet->>Runtime Manager: ForkSandbox(parentID, runtimeClassName="kata-openeuler-cow")
 
-    alt Kata with CoW
+    Runtime Manager->>Runtime Manager: GetRuntime("kata-openeuler-cow")
+    Note over Runtime Manager: 根据固定的RuntimeClass<br/>选择对应的Fork策略
+
+    alt Kata CoW Fork
         Runtime Manager->>CRI: ForkSandbox(shareMemory=true)
         CRI->>openEuler Kernel: syscall_cow_fork()
         openEuler Kernel->>openEuler Kernel: 创建CoW映射
         openEuler Kernel-->>CRI: 返回子沙箱ID
         CRI-->>Runtime Manager: ForkSandboxResponse(<100ms)
-    else Firecracker with eSnapshot
+    else Firecracker eSnapshot Fork
         Runtime Manager->>CRI: CheckpointSandbox()
         CRI->>openEuler Kernel: /dev/esnapshot ioctl
         openEuler Kernel-->>CRI: 快照路径
@@ -1141,14 +1293,16 @@ sequenceDiagram
         CRI->>openEuler Kernel: 从快照恢复
         openEuler Kernel-->>CRI: 子沙箱ID
         CRI-->>Runtime Manager: RestoreSandboxResponse(<1s)
-    else runc with PageCache
+    else runc PageCache Fork
         Runtime Manager->>CRI: ForkSandbox(sharePageCache=true)
         CRI->>openEuler Kernel: 共享PageCache
         openEuler Kernel-->>CRI: 子沙箱ID
         CRI-->>Runtime Manager: ForkSandboxResponse(<500ms)
     end
 
-    Runtime Manager-->>Controller: 返回子沙箱ID
+    Runtime Manager-->>SandboxSet: 返回子沙箱ID
+    SandboxSet->>Node Pool: 调度到对应节点池
+    Note over Node Pool: 根据nodeSelector<br/>调度到Kata节点池
 ```
 
 ##### F. 关键交付物
